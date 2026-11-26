@@ -15,7 +15,7 @@ import torch
 from huggingface_hub import ModelCard, ModelCardData
 
 from sentence_transformers import SentenceTransformer, SentenceTransformerTrainer, SentenceTransformerTrainingArguments
-from sentence_transformers.base.model_card import BaseModelCardData, generate_model_card
+from sentence_transformers.base.model_card import BaseModelCardCallback, BaseModelCardData, generate_model_card
 from sentence_transformers.base.modules import Router
 from sentence_transformers.sentence_transformer.losses import MultipleNegativesRankingLoss
 from sentence_transformers.util import is_datasets_available, is_training_available
@@ -142,6 +142,42 @@ def test_hf_jobs_hardware_templates(model_type, job_flavor, with_codecarbon) -> 
         assert "- **GPU Model**" not in card.text
         assert "- **CPU Model**" not in card.text
         assert "- **RAM Size**" not in card.text
+
+
+def test_training_duration(word_embeddings_model, tmp_path) -> None:
+    model = word_embeddings_model
+    args = SentenceTransformerTrainingArguments(output_dir=str(tmp_path), report_to=[])
+    trainer = SentenceTransformerTrainer(model=model, args=args)
+    callback = next(cb for cb in trainer.callback_handler.callbacks if isinstance(cb, BaseModelCardCallback))
+    hook_args = (trainer.args, trainer.state, trainer.control)
+    clock = [0.0]
+    with patch("sentence_transformers.base.model_card.time") as mock_time:
+        mock_time.time.side_effect = lambda: clock[0]
+        callback.on_train_begin(*hook_args, model=model)
+        # An eval DatasetDict reports one runtime per dataset
+        callback.on_evaluate(
+            *hook_args, model=model, metrics={"eval_first_runtime": 10.0, "eval_second_runtime": 20.0}
+        )
+        clock[0] = 100.0
+        callback.on_train_end(*hook_args, model=model)
+        # Evaluating and saving after training are not part of the training time
+        callback.on_evaluate(*hook_args, model=model, metrics={"eval_runtime": 50.0})
+        clock[0] = 600.0
+        assert model.model_card_data.get_training_duration_data() == {
+            "training_time": "1.2 minutes",
+            "evaluation_time": "30.0 seconds",
+            "total_time": "1.7 minutes",
+        }
+
+        # A second training run is timed on its own
+        callback.on_train_begin(*hook_args, model=model)
+        clock[0] = 620.0
+        callback.on_train_end(*hook_args, model=model)
+        assert model.model_card_data.get_training_duration_data() == {
+            "training_time": "20.0 seconds",
+            "evaluation_time": None,
+            "total_time": None,
+        }
 
 
 def _make_pil_image(width: int = 64, height: int = 64) -> PILModule.Image:

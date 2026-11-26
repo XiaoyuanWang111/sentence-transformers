@@ -192,7 +192,21 @@ class BaseModelCardCallback(TrainerCallback):
             for key, value in args_dict.items()
             if key not in ignore_keys and key in self.default_args_dict and value != self.default_args_dict[key]
         }
+        # Time each call to train() on its own, so a second training run does not inherit the first one's
+        # evaluation time.
         model.model_card_data._training_start_time = time.time()
+        model.model_card_data._training_end_time = None
+        model.model_card_data.evaluation_duration = 0.0
+
+    def on_train_end(
+        self,
+        args: BaseTrainingArguments,
+        state: TrainerState,
+        control: TrainerControl,
+        model: BaseModel,
+        **kwargs,
+    ) -> None:
+        model.model_card_data._training_end_time = time.time()
 
     def on_evaluate(
         self,
@@ -210,8 +224,12 @@ class BaseModelCardCallback(TrainerCallback):
         }
         if len(loss_dict) == 1 and "loss" in loss_dict:
             loss_dict = {"Validation Loss": loss_dict["loss"]}
-        if "eval_runtime" in metrics:
-            model.model_card_data.evaluation_duration += metrics["eval_runtime"]
+        # Evaluations after training are not part of its duration. With an eval DatasetDict, each dataset
+        # reports its own runtime as eval_{dataset_name}_runtime.
+        if model.model_card_data._training_end_time is None:
+            model.model_card_data.evaluation_duration += sum(
+                value for key, value in metrics.items() if key.startswith("eval_") and key.endswith("_runtime")
+            )
 
         if (
             model.model_card_data.training_logs
@@ -274,6 +292,7 @@ IGNORED_FIELDS = [
     "_asset_cache",
     "_cached_dict",
     "_training_start_time",
+    "_training_end_time",
     "evaluation_duration",
 ]
 
@@ -400,6 +419,7 @@ class BaseModelCardData(CardData):
     code_carbon_callback: CodeCarbonCallback | None = field(default=None, init=False)
     hf_job_flavor: str | None = field(default=None, init=False)
     _training_start_time: float | None = field(default=None, init=False)
+    _training_end_time: float | None = field(default=None, init=False)
     evaluation_duration: float = field(default=0.0, init=False)
     citations: dict[str, str] = field(default_factory=dict, init=False)
     best_model_step: int | None = field(default=None, init=False)
@@ -1922,7 +1942,9 @@ class BaseModelCardData(CardData):
     def get_training_duration_data(self) -> dict[str, str | None]:
         if self._training_start_time is None:
             return {"training_time": None, "evaluation_time": None, "total_time": None}
-        total_duration = time.time() - self._training_start_time
+        # Until training ends, e.g. when a checkpoint is saved, report the time so far
+        end_time = self._training_end_time if self._training_end_time is not None else time.time()
+        total_duration = end_time - self._training_start_time
         training_duration = total_duration - self.evaluation_duration
         return {
             "training_time": format_duration(training_duration),
